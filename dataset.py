@@ -45,7 +45,7 @@ def _load_annotations(anno_dir, split):
                 return json.load(f)
 
     # Try combined file with "split" field
-    for pattern in ["data_captions.json", "annotations.json", "data.json"]:
+    for pattern in ["data_captions.json", "reid_raw.json", "ICFG-PEDES.json", "annotations.json", "data.json"]:
         path = os.path.join(anno_dir, pattern)
         if os.path.exists(path):
             with open(path) as f:
