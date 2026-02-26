@@ -270,7 +270,7 @@ def evaluate(model, image_loader, text_loader, config):
     text_feats = torch.cat(text_feats, dim=0)
     text_ids = torch.tensor(text_ids)
 
-    # Compute similarity via negative Lorentz distance
+    # Compute similarity via Lorentzian inner product (Eq 6 in paper)
     _curv = curv.exp().cpu()
     # Process in chunks to avoid OOM for large test sets
     chunk_size = 256
@@ -281,7 +281,7 @@ def evaluate(model, image_loader, text_loader, config):
     t2i_ranks = []
     for i in range(0, n_texts, chunk_size):
         tf = text_feats[i : i + chunk_size]
-        sim = -L.pairwise_dist(tf, image_feats, _curv)  # [chunk, n_images]
+        sim = L.pairwise_inner(tf, image_feats, _curv)  # [chunk, n_images]
         sorted_idx = sim.argsort(dim=1, descending=True)
         for j in range(tf.size(0)):
             qid = text_ids[i + j]
@@ -295,7 +295,7 @@ def evaluate(model, image_loader, text_loader, config):
     i2t_ranks = []
     for i in range(0, n_images, chunk_size):
         imf = image_feats[i : i + chunk_size]
-        sim = -L.pairwise_dist(imf, text_feats, _curv)  # [chunk, n_texts]
+        sim = L.pairwise_inner(imf, text_feats, _curv)  # [chunk, n_texts]
         sorted_idx = sim.argsort(dim=1, descending=True)
         for j in range(imf.size(0)):
             qid = image_ids[i + j]
