@@ -34,6 +34,11 @@ import yaml
 
 from misc.utils import setup_seed, is_using_distributed, is_main_process, get_rank, get_world_size
 from model.clip_model import clip_vitb
+from unified_modality_grad_modulator import (
+    UnifiedModalityGradModulator,
+    UnifiedModulationConfig,
+    HookMode,
+)
 from model import lorentz as L
 from dataset import (
     TrainDataset,
@@ -184,28 +189,38 @@ def build_scheduler(optimizer, config, steps_per_epoch):
     lr_start = config.schedule.lr_start
     lr_end = config.schedule.lr_end
 
+    # lr_scale_ref is a mutable list so lr_lambda can read external updates
+    lr_scale_ref = [1.0]
+
     def lr_lambda(step):
         if step < warmup_steps:
             # Linear warmup
-            return lr_start / lr + (1.0 - lr_start / lr) * step / warmup_steps
+            base = lr_start / lr + (1.0 - lr_start / lr) * step / warmup_steps
         else:
             # Cosine decay
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return lr_end / lr + 0.5 * (1.0 - lr_end / lr) * (1.0 + math.cos(math.pi * progress))
+            base = lr_end / lr + 0.5 * (1.0 - lr_end / lr) * (1.0 + math.cos(math.pi * progress))
+        return base * lr_scale_ref[0]
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    sched.lr_scale_ref = lr_scale_ref  # expose for external updates
+    return sched
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, scheduler, epoch, config):
+def train_one_epoch(model, loader, optimizer, scheduler, epoch, config, modulator=None):
     model.train()
     total_loss = 0.0
     n_batches = len(loader)
     alpha_max = config.model.softlabel_ratio
     total_epochs = config.schedule.epoch
     print_period = config.log.print_period
+
+    # AGM: build layer mapping for this epoch
+    if modulator is not None:
+        modulator.on_epoch_start(model)
 
     t0 = time.time()
     for step, batch in enumerate(loader):
@@ -214,11 +229,41 @@ def train_one_epoch(model, loader, optimizer, scheduler, epoch, config):
         total_steps = total_epochs * n_batches
         alpha = alpha_max * min(1.0, global_step / total_steps)
 
+        # AGM: pre-forward hooks (registers activation capture)
+        if modulator is not None:
+            modulator.pre_forward(model)
+
+        # Normal forward pass
         losses = model(batch, alpha)
         loss = sum(losses.values())
 
+        # AGM: capture normal activations
+        if modulator is not None:
+            modulator.capture('normal', model)
+
+            # Erased forward passes for modal specificity detection
+            with torch.no_grad():
+                modulator.pre_forward(model)
+                e_img_losses = model(batch, alpha, type='E_IMG')
+                modulator.capture('e_img', model)
+
+                modulator.pre_forward(model)
+                e_txt_losses = model(batch, alpha, type='E_TXT')
+                modulator.capture('e_txt', model)
+
+            e_img_loss = sum(e_img_losses.values()).item()
+            e_txt_loss = sum(e_txt_losses.values()).item()
+
         optimizer.zero_grad()
         loss.backward()
+
+        # AGM: adaptive gradient modulation (after backward, before step)
+        if modulator is not None:
+            modulator.post_backward(
+                model, step, n_batches, config.data.batch_size,
+                loss.item(), e_txt_loss, e_img_loss,
+            )
+
         optimizer.step()
         scheduler.step()
 
@@ -238,6 +283,14 @@ def train_one_epoch(model, loader, optimizer, scheduler, epoch, config):
     avg_loss = total_loss / n_batches
     if is_main_process():
         print(f"  Epoch [{epoch}] avg_loss: {avg_loss:.4f}  time: {time.time()-t0:.0f}s")
+
+    # AGM: epoch-end cleanup and stats
+    agm_stats = None
+    if modulator is not None:
+        agm_stats = modulator.on_epoch_end(model, epoch)
+        if is_main_process() and agm_stats:
+            print(f"  [AGM] Epoch {epoch} stats: {agm_stats}")
+
     return avg_loss
 
 
@@ -270,7 +323,7 @@ def evaluate(model, image_loader, text_loader, config):
     text_feats = torch.cat(text_feats, dim=0)
     text_ids = torch.tensor(text_ids)
 
-    # Compute similarity via negative Lorentz distance
+    # Compute similarity via Lorentzian inner product (Eq 6 in paper)
     _curv = curv.exp().cpu()
     # Process in chunks to avoid OOM for large test sets
     chunk_size = 256
@@ -281,7 +334,7 @@ def evaluate(model, image_loader, text_loader, config):
     t2i_ranks = []
     for i in range(0, n_texts, chunk_size):
         tf = text_feats[i : i + chunk_size]
-        sim = -L.pairwise_dist(tf, image_feats, _curv)  # [chunk, n_images]
+        sim = L.pairwise_inner(tf, image_feats, _curv)  # [chunk, n_images]
         sorted_idx = sim.argsort(dim=1, descending=True)
         for j in range(tf.size(0)):
             qid = text_ids[i + j]
@@ -295,7 +348,7 @@ def evaluate(model, image_loader, text_loader, config):
     i2t_ranks = []
     for i in range(0, n_images, chunk_size):
         imf = image_feats[i : i + chunk_size]
-        sim = -L.pairwise_dist(imf, text_feats, _curv)  # [chunk, n_texts]
+        sim = L.pairwise_inner(imf, text_feats, _curv)  # [chunk, n_texts]
         sorted_idx = sim.argsort(dim=1, descending=True)
         for j in range(imf.size(0)):
             qid = image_ids[i + j]
@@ -419,6 +472,26 @@ def main():
     model = load_clip_weights(model, config)
     model = model.cuda()
 
+    # AGM: Initialize gradient modulator
+    agm_enabled = getattr(config, 'agm', None) is not None and getattr(config.agm, 'enabled', True)
+    modulator = None
+    if agm_enabled or True:  # Enable by default for this branch
+        agm_config = UnifiedModulationConfig.irra_preset(
+            fig1c_enabled=False,
+            grad_ratio_tracking=False,
+            output_dir=args.output_dir,
+        )
+        modulator = UnifiedModalityGradModulator(agm_config)
+        # GAHR module filters: shared=BiCrossAttention, img=visual, txt=encode_text
+        modulator.attach(
+            model,
+            shared_filter=lambda name, mod: "Bi_cross_attention" in name,
+            img_enc_filter=lambda name, mod: name.startswith("visual."),
+            txt_enc_filter=lambda name, mod: name.startswith("encode_text."),
+        )
+        if is_main_process():
+            print(f"[AGM] Modulator attached (IRRA preset, PLUGIN mode)")
+
     if is_using_distributed():
         model = DDP(model, device_ids=[get_rank()], find_unused_parameters=True)
 
@@ -427,6 +500,13 @@ def main():
         model.module if is_using_distributed() else model, config
     )
     scheduler = build_scheduler(optimizer, config, len(train_loader))
+
+    # ReduceLROnPlateau: if R@1 doesn't improve for `patience` epochs, scale LR by `factor`
+    plateau_patience = getattr(config.schedule, 'plateau_patience', 5)
+    plateau_factor = getattr(config.schedule, 'plateau_factor', 0.5)
+    plateau_min_lr = getattr(config.schedule, 'plateau_min_lr', 1e-7)
+    plateau_counter = 0
+    lr_scale = 1.0  # multiplicative factor applied on top of cosine schedule
 
     start_epoch = 0
     best_r1 = 0.0
@@ -451,14 +531,24 @@ def main():
             print(f"Epoch {epoch}/{config.schedule.epoch - 1}")
             print(f"{'='*60}")
 
-        train_one_epoch(model, train_loader, optimizer, scheduler, epoch, config)
+        train_one_epoch(model, train_loader, optimizer, scheduler, epoch, config, modulator)
 
         if is_main_process():
             r1 = evaluate(model, test_image_loader, test_text_loader, config)
             if r1 > best_r1:
                 best_r1 = r1
+                plateau_counter = 0
                 save_checkpoint(model, optimizer, epoch, best_r1, args.output_dir)
-            print(f"  Current R@1: {r1:.2f}  |  Best R@1: {best_r1:.2f}")
+            else:
+                plateau_counter += 1
+                if plateau_counter >= plateau_patience:
+                    lr_scale *= plateau_factor
+                    scheduler.lr_scale_ref[0] = lr_scale
+                    plateau_counter = 0
+                    print(f"  ** Plateau detected: LR scaled by {plateau_factor}, "
+                          f"lr_scale={lr_scale:.4f}")
+            print(f"  Current R@1: {r1:.2f}  |  Best R@1: {best_r1:.2f}  |  "
+                  f"plateau: {plateau_counter}/{plateau_patience}")
 
         if is_using_distributed():
             dist.barrier()

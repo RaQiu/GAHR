@@ -65,7 +65,7 @@ class CLIP(nn.Module):
             z_y = y.detach() 
             return - (F.cosine_similarity(p_x, z_y, dim=-1).mean() + F.cosine_similarity(p_y, z_x, dim=-1).mean()) * 0.5   
 
-    def forward(self, input, alpha):
+    def forward(self, input, alpha, type=None):
         ret = dict()
 
         images = input['image'].to(self.config.device)
@@ -90,6 +90,15 @@ class CLIP(nn.Module):
 
         image_features, image_seq_embeddings = self.encode_image(images, self.curv, return_dense=True)
         text_features, text_seq_embeddings = self.encode_text(text_tokens, self.curv, return_dense=True)
+
+        # AGM: erase one modality for modal specificity detection
+        if type == 'E_IMG':
+            image_features = torch.zeros_like(image_features)
+            image_seq_embeddings = torch.zeros_like(image_seq_embeddings)
+        elif type == 'E_TXT':
+            text_features = torch.zeros_like(text_features)
+            text_seq_embeddings = torch.zeros_like(text_seq_embeddings)
+
         image_features_norm = image_features
         text_features_norm = text_features
         image_features_norm_gathered = self.all_gather(image_features_norm)
@@ -107,6 +116,15 @@ class CLIP(nn.Module):
         with torch.no_grad():
             image_features_s, image_seq_embeddings_s = self.encode_image(images, self.curv, return_dense=True)
             text_features_s, text_seq_embeddings_s = self.encode_text(text_tokens, self.curv, return_dense=True)
+
+            # AGM: erase soft-label features consistently
+            if type == 'E_IMG':
+                image_features_s = torch.zeros_like(image_features_s)
+                image_seq_embeddings_s = torch.zeros_like(image_seq_embeddings_s)
+            elif type == 'E_TXT':
+                text_features_s = torch.zeros_like(text_features_s)
+                text_seq_embeddings_s = torch.zeros_like(text_seq_embeddings_s)
+
             image_features_s_norm = image_features_s
             text_features_s_norm = text_features_s
             image_features_s_norm_gathered = self.all_gather(image_features_s_norm)
@@ -147,8 +165,8 @@ class CLIP(nn.Module):
                 = self.Bi_cross_attention(image_seq_embeddings, text_seq_embeddings) 
             image_loss = self.bt2i(image_seq_embeddings, text_to_local_image_embed, self.predictor)
             text_loss = self.bi2t(text_seq_embeddings, image_to_local_text_embed)
-            ret['bai_loss'] =  (image_loss + text_loss) * self.config.experiment.bai_ratio 
-            
+            ret['bai_loss'] =  (image_loss + text_loss) * self.config.experiment.bai_ratio
+
         return ret
     
     def sms_contrastive(self, image_features, text_features, image_features_s, text_features_s,
@@ -160,16 +178,17 @@ class CLIP(nn.Module):
             with torch.no_grad():
                 sim_i2t_s = logit_scale * (-L.pairwise_dist(image_features_s, text_features_s_gathered, _curv))
                 sim_t2i_s = logit_scale * (-L.pairwise_dist(text_features_s, image_features_s_gathered, _curv))
+                # cross-modal similarity for SMS margin
                 sim_i2i_s = -L.pairwise_dist(image_features_s, text_features_s_gathered, _curv)
                 sim_t2t_s = -L.pairwise_dist(text_features_s, image_features_s_gathered, _curv)
                 sim_i2t_targets = alpha * F.softmax(sim_i2t_s, dim=1) + (1 - alpha) * sim_targets
-                sim_t2i_targets = alpha * F.softmax(sim_t2i_s, dim=1) + (1 - alpha) * sim_targets  # soft + hard
+                sim_t2i_targets = alpha * F.softmax(sim_t2i_s, dim=1) + (1 - alpha) * sim_targets
             sim_i2t = logit_scale * (-L.pairwise_dist(image_features, text_features_gathered, _curv))
             sim_t2i = logit_scale * (-L.pairwise_dist(text_features, image_features_gathered, _curv))
             loss_i2t = -torch.sum(F.log_softmax(sim_i2t + self.lamda * logit_scale * (torch.diag(sim_i2i_s).unsqueeze(1) - sim_i2i_s), dim=1) * sim_i2t_targets, dim=1).mean()
             loss_t2i = -torch.sum(F.log_softmax(sim_t2i + self.lamda * logit_scale * (torch.diag(sim_t2t_s).unsqueeze(1) - sim_t2t_s), dim=1) * sim_t2i_targets, dim=1).mean()
-            loss_ita = (loss_i2t + loss_t2i) / 2        
-        return loss_ita     
+            loss_ita = (loss_i2t + loss_t2i) / 2
+        return loss_ita
 
 
     @property
